@@ -10,6 +10,36 @@ When you're done, all **20 pgTAP tests** must pass.
 
 ---
 
+## Retrieval-Model Decisions
+
+### Decision 1: Store embeddings as `vector(1536)`, with an HNSW cosine index
+Spec said: `embedding vector(1536) NOT NULL`, using the pgvector type, plus `idx_incident_chunks_embedding` built with `USING hnsw (embedding vector_cosine_ops)`.
+Schema decided: Enable `CREATE EXTENSION IF NOT EXISTS vector;` at the top of the migration. Change `embedding` from `TEXT` to `vector(1536) NOT NULL`. Add the HNSW index with `vector_cosine_ops`, and add a B-tree index on `incident_id`.
+Reason: A `TEXT` embedding is a string. Postgres cannot compute a distance from it, the `<=>` operator does not apply, and no ANN index can be built on it. So every similarity search would mean loading every row and parsing it in application code. The `vector(1536)` type stores real vectors and rejects any row with the wrong number of dimensions, which catches mistakes like using a different embedding model. The HNSW index lets the search run once per incident opened without comparing against every chunk. `vector_cosine_ops` matches the `<=>` (cosine distance) operator the query uses. If the operator class and the query operator don't match, Postgres doesn't use the index and scans the whole table. The B-tree on `incident_id` supports "all chunks of this incident", which both the cascade delete and re-embedding rely on.
+
+### Decision 2: `ON DELETE CASCADE` from chunks back to their incident
+Spec said: `incident_id BIGINT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE`, because a chunk has no meaning without its incident.
+Schema decided: Change `incident_id` from a nullable `INTEGER` with no delete rule to `BIGINT NOT NULL ... ON DELETE CASCADE`. Also widen `id` to `BIGSERIAL`, and make `chunk_text` and `created_at` (`TIMESTAMPTZ`) `NOT NULL`.
+Reason: Chunks are derived data, so their lifecycle follows the source row. With CASCADE, deleting an incident removes its vectors in the same transaction, so a search can never return an incident that no longer exists. Without a delete rule, the delete is blocked (the default is `NO ACTION`), or someone has to clean up the chunks by hand. `INTEGER` is the wrong type for a reference to a `BIGSERIAL` key, because it overflows once `incidents.id` goes past 2^31. `NOT NULL` rules out orphan chunks that point at no incident.
+
+### Decision 3: Copy `team_id` and `severity` onto every chunk
+Spec said: `team_id BIGINT NOT NULL` and `severity TEXT NOT NULL` on `incident_chunks`, as denormalised filter metadata.
+Schema decided: Add both columns as `NOT NULL`, copied from the parent incident when chunks are written.
+Reason: The retrieval query is hybrid: it ranks by similarity and filters on `team_id = $2 AND severity = 'P1'`. If the filter values live on the same row as the vector, Postgres can rank and filter in one pass over the HNSW results, without a join to `incidents` for every candidate. `NOT NULL` matters here: a chunk with an empty filter column would never match a filtered search, so the incident would silently never be found. The trade-off is drift. When an incident moves team or changes severity, the write path has to update its chunks in the same transaction, or filtered search quietly returns the wrong team's incidents.
+
+## Rejected Shape
+
+### Shape: a single `embedding TEXT` column on `incidents`
+What it was: `ALTER TABLE incidents ADD COLUMN embedding TEXT;` — one embedding per incident, stored on the authoritative row.
+Why rejected: Incident descriptions are long, multi-paragraph text: symptoms, timeline, root cause, resolution. One vector for all of it averages those topics together into a vague "centre of meaning" that isn't close to any one of them. The right model is one-to-many: one incident, many chunks, one vector per chunk, which is what `incident_chunks` provides. The column was also `TEXT`, so it couldn't be searched by distance at all. And putting derived data on the source-of-truth row mixes up two things that change on different schedules.
+What would break:
+- **Retrieval granularity.** A new incident about a "TLS certificate expiry on the payments gateway" won't match a past incident whose resolution paragraph describes exactly that fix, if that paragraph is one of six in the description. Its signal gets diluted by the other five, so the averaged vector ranks below shorter, less relevant incidents. The assistant then drafts its summary from the wrong past incidents.
+- **Model input limits.** Embedding models have a maximum input length. A long description either fails to embed or gets cut off silently, so everything after the cut-off (often the resolution, which is the part responders need) is never searchable.
+- **No citation.** With one vector per incident, the system can say which incident matched but not which passage. The assistant can't quote the specific resolution text it is relying on, which makes grounding weaker and answers harder to check.
+- **Costly re-embedding.** Fixing a typo in one paragraph means re-embedding the whole incident. With chunks, only the changed chunk is re-embedded.
+
+---
+
 ## Prerequisites
 
 | Tool | Why | Check |
@@ -192,31 +222,7 @@ git commit -m "fix: repair the incident retrieval schema to match the spec"
 
 2. Update this `README.md` with exactly **3 retrieval-model decisions** and **1 rejected shape**:
 
-```markdown
-## Retrieval-Model Decisions
-
-### Decision 1: [Embedding storage decision]
-Spec said: ...
-Schema decided: ...
-Reason: ...
-
-### Decision 2: [ON DELETE decision]
-Spec said: ...
-Schema decided: ...
-Reason: ...
-
-### Decision 3: [Filter-metadata / denormalisation decision]
-Spec said: ...
-Schema decided: ...
-Reason: ...
-
-## Rejected Shape
-
-### Shape: [name what you removed or rejected]
-What it was: ...
-Why rejected: ...
-What would break: ...
-```
+_Done: see [Retrieval-Model Decisions](#retrieval-model-decisions) and [Rejected Shape](#rejected-shape) at the top of this README._
 
 3. Push and open a PR:
 ```bash
