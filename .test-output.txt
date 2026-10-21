@@ -1,0 +1,21 @@
+1..20
+ok 1 - pgvector extension is enabled
+ok 2 - incident_chunks table exists
+ok 3 - rejected incidents.embedding column is gone
+ok 4 - id is BIGINT (BIGSERIAL)
+ok 5 - id is the primary key
+ok 6 - incident_id is BIGINT
+ok 7 - embedding is vector(1536)
+ok 8 - team_id is BIGINT
+ok 9 - severity is TEXT
+ok 10 - created_at is TIMESTAMPTZ
+ok 11 - incident_id is NOT NULL
+ok 12 - chunk_text is NOT NULL
+ok 13 - embedding is NOT NULL
+ok 14 - team_id is NOT NULL
+ok 15 - severity is NOT NULL
+ok 16 - created_at is NOT NULL
+ok 17 - incident_id references incidents(id)
+ok 18 - FK is ON DELETE CASCADE
+ok 19 - idx_incident_chunks_embedding is HNSW with vector_cosine_ops
+ok 20 - idx_incident_chunks_incident_id is a B-tree
